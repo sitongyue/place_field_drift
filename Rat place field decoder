@@ -1,0 +1,171 @@
+# clone to your working directory keras-complex: https://github.com/JesperDramsch/keras-complex
+# kera-complex is now updated to ONLY support tensorflow >2.x
+!git clone https://github.com/JesperDramsch/keras-complex.git
+!pip install -r /content/keras-complex/requirements.txt
+!pip install /content/keras-complex  # install from local clone instead of PyPI
+
+from keras import utils as np_utils
+from keras.callbacks import EarlyStopping
+from keras import models, layers, optimizers, backend,constraints,activations
+import complexnn
+from scipy import io
+import numpy as np
+import pandas as pd
+from random import sample
+from matplotlib import pyplot as plt  # for plotting
+
+from google.colab import drive
+drive.mount('/content/drive')
+
+def balanced_indices(vector, bool_indices):
+    """
+    Returns indices that balance the number of samples for each label in vector
+
+    Parameters:
+    vector: The input vector from which to select indices.
+    bool_indices: A boolean array indicating which indices in the vector to consider.
+
+    Returns:
+    list: A list of indices representing a balanced selection of the unique values in the subset of the vector.
+
+    Generated using ChatGPT
+    """
+    # Convert boolean indices to actual indices
+    actual_indices = np.where(bool_indices)[0]
+
+    # Extract the elements and their corresponding indices
+    selected_elements = [(vector[i], i) for i in actual_indices]
+
+    # Find unique elements
+    unique_elements = np.unique(vector[bool_indices])
+
+    # Group elements by value and collect their indices
+    elements_indices = {element: [] for element in unique_elements}
+    for value, idx in selected_elements:
+        if value in elements_indices:
+            elements_indices[value].append(idx)
+
+    # Find the minimum count among the unique elements
+    min_count = min(len(elements_indices[element]) for element in unique_elements)
+
+    # Create a balanced set of indices
+    balanced_indices_set = []
+    for element in unique_elements:
+        if len(elements_indices[element]) >= min_count:
+            balanced_indices_set.extend(sample(elements_indices[element], min_count))
+
+    return np.array(balanced_indices_set)
+
+def makeRBF_linear2(pos, n_bases, sigma):
+    pvecx = np.linspace(0, 1, n_bases)
+    pvecy = np.linspace(0, 5, 6)  # 6 virtual arms instead of 3
+
+    xg, yg = np.meshgrid(pvecx, pvecy)
+    xg = xg.reshape((1, -1))
+    yg = yg.reshape((1, -1))
+
+    sigma = sigma**2
+    xDiff = (pos[:, 0].reshape((-1, 1)) - xg)**2
+    xDiff = np.exp(-xDiff/sigma/2) * (pos[:, 1].reshape((-1, 1)) == yg)
+    row_sums = np.sum(xDiff, axis=1).reshape((-1, 1))
+    xDiff = xDiff / (row_sums + 1e-10)
+    xg = np.vstack((xg, yg)).T
+    return xDiff, xg
+
+
+
+# spikes decoder with optimal hyperparameters
+
+folds = 5 #number of folds for training in 5-fold cross validation
+#RBF = Radial basis function - this is the gaussian distribution you use for each position on the track
+ks = [64]
+
+sigs = [0.11]
+
+# dim 1: session # (NOTE: only sessions 1 through 4 are relevant)
+# dim 2: fold for cross-validation
+# dim 3: number of RBFs
+# dim 4: number of widths
+# dim 5: metrics
+allDat = np.zeros((4,folds,len(ks),len(sigs),6)) # def dimensions for allDat
+
+es = EarlyStopping(monitor='val_loss', patience=14) 
+fldr = '/content/drive/MyDrive/beatLab/processed-rat-data/' #where data lives
+savefldr = '/content/drive/MyDrive/beatLab/raffi_trained_models_spikes/'
+# ^ change this before running
+err_allsess = []
+
+for i in range(allDat.shape[0]): # loops through sessions 1 thru 4
+    #io.loadmat converts matlab file into python file
+    #fldr + 'spDat' + str(i+1) + '0.mat' outputs /content/drive/MyDrive/beatLab/processed-rat-data/spDat(i+1)0.mat
+    mat = io.loadmat(fldr + 'spDat' + str(i+1) + '0.mat') #only spike data for all phases
+    lapID = mat['lapID']
+    pos = mat['pos']
+    vel = mat['vel']
+    pos = pos-np.min(pos,axis=0)
+    pos = pos/np.expand_dims(np.max(pos,axis=0),axis=0)
+    pos = np.hstack((pos,mat['lapID'][:,2].reshape((-1,1))))
+
+    #mask keeps only phases 1 and 3 and when rat is moving (vel>8)
+    mask = ((lapID[:,4] == 1) | (lapID[:,4] == 3)) & (np.abs(vel) > 8) 
+    mask = mask.ravel()
+    #mask2 allows us to divide by phase 2 so that we can normalize position values correctly
+    mask2 = (lapID[:,4] == 2) & (np.abs(vel) > 8)
+    mask2 = mask2.ravel()
+
+    pos2 = pos[mask2]
+    pos = pos[mask]
+
+    pos[:,0] = pos[:,0]/np.min(pos2[:,0]) #dividing by the minimum in phase 2 so that the values can be normalized between 0 and 1
+    
+    lapID = lapID[mask]
+
+
+    for kk in range(allDat.shape[1]):   # cross-validation=5 #choose 4 folds for training and 1 for testing
+        fold = kk + 1
+        inds_test  = lapID[:, 1] == fold      # this fold is the test set
+        inds_train = lapID[:, 1] != fold      # everything else is training
+
+        X = mat['X'][mask]
+
+        for k in range(allDat.shape[2]): #RBFs
+            for l in range(allDat.shape[3]): #sigma for RBFs
+                Y,km = makeRBF_linear2(pos, int(ks[k]),sigs[l]) # make RBFs
+                #km tells which arm and which position in each arm each RBF is
+                #Y is a matrix with probabilities of which RBF the rat is in given rats position and arm
+                num_chans = Y.shape[1]
+                #num_chans=384=total RBFs (384/6=64)
+                backend.clear_session()
+                #forgets previous keras session to prevent conflicts between old and new models
+                adam = optimizers.Adam(learning_rate=.001)
+                model = models.Sequential()
+                #simple linear NN model
+
+                # layer only for spikes
+                model.add(layers.Dense(num_chans,input_shape=(X.shape[1],),kernel_constraint=constraints.unit_norm()))
+                #fully connected layer with num_chans output nodes with number of spikes (X.shape[1]) as inputs and renormalized weights' magnitude after each gradient descent
+
+                model.add(layers.Activation(activations.softmax))
+                #adds softmax as activation function
+
+                print(f'Session {i+1}, fold {kk+1}: k={k}, sig={l}')
+                model.compile(loss='mse', optimizer=adam,metrics = ['accuracy']) #fitting the gaussian output of RBF
+                fittedModel = model.fit(X[inds_train,:], Y[inds_train,:], epochs = 100,
+                    verbose = 2, validation_data=(X[inds_test,:],Y[inds_test,:]),
+                    shuffle=True, callbacks=[es])
+
+                Yhat = np.argmax(model.predict(X),axis = 1) #model takes highest probability RBF to choose where it thinks rat is
+                xyg = km[Yhat,:]
+                err = np.abs(xyg[:,0]-pos[:,0]) #absolute error
+                err[xyg[:,1] != pos[:,1]] = 1 #if wrong track, err = 1
+
+                allDat[i][kk][k][l][0] = fittedModel.history['accuracy'][-2]
+                allDat[i][kk][k][l][1] = fittedModel.history['val_accuracy'][-2]
+                allDat[i][kk][k][l][2] = fittedModel.history['loss'][-2]
+                allDat[i][kk][k][l][3] = fittedModel.history['val_loss'][-2]
+                allDat[i][kk][k][l][4] = np.mean(err[inds_train])
+                allDat[i][kk][k][l][5] = np.mean(err[inds_test]) #mean test error
+                print(f'mean test error = {np.mean(err[inds_test])}')
+
+                model.save_weights(f'{savefldr}model_sess{i+1}_fold{kk+1}_k{k}_sig{l}.weights.h5')
+                del model, fittedModel
