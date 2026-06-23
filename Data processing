@@ -1,0 +1,362 @@
+from google.colab import drive
+drive.mount('/content/drive')
+
+
+
+from scipy import signal
+def filter_data(data, cutoff, fs, filt_type='high', order=5, use_hilbert=False):
+    """
+    Applies a column-wise zero-phase filter to data
+
+    Parameters:
+    data : a T x N array with filtered data
+    cutoff : cutoff frequency (should be 2 numbers for 'band')
+    fs : sampling rate
+    filt_type : specify as 'high', 'low', or 'band'.
+    order : filter order. The default is 5.
+    use_hilbert: whether to apply a Hilbert transform (default = False)
+
+    Returns
+    -------
+    data : a T x N array with filtered data
+    """
+    nyq = 0.5 * fs
+    if filt_type == 'band':
+        if len(cutoff) != 2:
+            raise ValueError("Cutoff should contain exactly two numbers for 'band' filter type.")
+        normal_cutoff = [c / nyq for c in cutoff]
+    else:
+        normal_cutoff = cutoff / nyq
+
+    b, a = signal.butter(order, normal_cutoff, btype=filt_type, analog=False)
+    data = signal.filtfilt(b, a, data, axis=0)
+    if use_hilbert:
+        data = signal.hilbert(data, axis=0)
+    return data
+
+
+
+from random import sample
+
+def balanced_indices(vector, bool_indices):
+    """
+    Returns indices that balance the number of samples for each label in vector
+
+    Parameters:
+    vector: The input vector from which to select indices.
+    bool_indices: A boolean array indicating which indices in the vector to consider.
+
+    Returns:
+    list: A list of indices representing a balanced selection of the unique values in the subset of the vector.
+
+    Generated using ChatGPT
+    """
+    # Convert boolean indices to actual indices
+    actual_indices = np.where(bool_indices)[0]
+
+    # Extract the elements and their corresponding indices
+    selected_elements = [(vector[i], i) for i in actual_indices]
+
+    # Find unique elements
+    unique_elements = np.unique(vector[bool_indices])
+
+    # Group elements by value and collect their indices
+    elements_indices = {element: [] for element in unique_elements}
+    for value, idx in selected_elements:
+        if value in elements_indices:
+            elements_indices[value].append(idx)
+
+    # Find the minimum count among the unique elements
+    min_count = min(len(elements_indices[element]) for element in unique_elements)
+
+    # Create a balanced set of indices
+    balanced_indices_set = []
+    for element in unique_elements:
+        if len(elements_indices[element]) >= min_count:
+            balanced_indices_set.extend(sample(elements_indices[element], min_count))
+
+    return np.array(balanced_indices_set)
+
+
+def test_train(lapID, which_phase, n_folds=5, which_fold=0):
+    """
+    Returns test and train samples
+
+    Parameters:
+    - lapID: contains info about trial number and maze arm of each sample
+    - which_phase: which phase of the session to use (see get_data\get_behav for info)
+    - n_folds: how many folds to assign
+    - which_fold: which fold to return values for
+
+    Returns:
+    - train_inds: which samples to use for training model
+    - test_inds: which samples to use for testing model
+    """
+    ctr = np.zeros(3)
+    use_sample = lapID[:, 3] == which_phase
+    if which_phase == 2:  # period where rat is staying at port
+        use_sample = use_sample & (lapID[:, 2] == 1)  # only use correct trials
+    fold_assign = -np.ones(np.size(use_sample))
+    for i in range(int(np.max(lapID[:, 0]))):
+        inds = (lapID[:, 0] == i) & use_sample
+        if np.sum(inds):
+            which_arm = int(lapID[inds, 1][0])
+            fold_assign[inds] = ctr[which_arm] % n_folds
+            ctr[which_arm] += 1
+    test_inds = fold_assign == which_fold
+    train_inds = np.isin(fold_assign, np.arange(n_folds)) & ~test_inds
+    train_inds = balanced_indices(lapID[:, 1], train_inds)
+    return test_inds, train_inds
+
+
+def group_by_pos(pos, num_bins, train_inds):
+    """
+    Subdivides track into bins for training linear classifier on demodulated LFP
+
+    Parameters
+    ----------
+    pos : a vector that contains the position of the animal along the track
+    num_bins : a scalar int that indicates how many bins to divide the track into
+
+    Returns
+    -------
+    pos : a vector of binned positions
+    """
+    pos = pos - np.min(pos[train_inds])
+    pos = pos / (np.max(pos[train_inds]) + 10 ** -8)
+    pos = np.int32(np.floor(pos * num_bins))
+    return pos
+
+
+
+import math
+from scipy.signal import decimate
+import numpy as np
+import os
+from scipy import io
+from scipy.stats import mode
+import h5py
+
+N_SESSIONS = 4
+FS     = 25.0  # sampling rate (Hz)
+CUTOFF   = 3.0   # lowpass cutoff frequency (Hz), must be < FS / 2
+DATA_PATH  = "/content/drive/MyDrive/beatLab/raw_data"
+
+# data0i.mat lapID column indices
+COL_TRIAL = 0  # trial number
+COL_ARM   = 1  # maze arm (0/1/2; -1 = outside arms)
+COL_XPOS  = 4  # x position
+COL_PHASE = 3  # phase: 0=other, 1=towards port, 2=at port, 3=away from port
+
+PHASE_NAMES = {1: "running towards port",
+          2: "at reward port",
+          3: "running away from port"}
+
+def get_spikes(mat_file, fs=25, session=1):
+    """
+    Counts spikes for each neuron in each time bin
+
+    Input:
+    mat_file = file containing spike data
+    fs = sampling rate
+
+    Output:
+    sp = binned spikes
+    """
+    mat = io.loadmat(mat_file, variable_names=['Spike', 'Clu', 'xml'])
+
+    # determine CA1 shank threshold based on session
+    if session <= 2:
+        ca1_threshold = 32   # sessions 1/2: shanks 1-32 are CA1
+    else:
+        ca1_threshold = 24   # sessions 3/4: shanks 1-24 are CA1
+
+    n_channels = mat['xml']['nChannels'][0][0][0][0]
+    dec = int(1250 / fs)
+    max_spike_res = np.ceil(np.max(mat['Spike']['res'][0][0]) / dec) + 1
+    max_spike_clu = np.max(mat['Spike']['totclu'][0][0]) + 1  # Precompute the bins
+    bins_res = np.arange(max_spike_res)
+    bins_clu = np.arange(max_spike_clu)
+    spike_res = np.squeeze(mat['Spike']['res'][0][0]) // dec
+    spike_clu = np.squeeze(mat['Spike']['totclu'][0][0]) - 1
+
+    # Bin both dimensions using histogram2d.
+    sp, _, _ = np.histogram2d(spike_res, spike_clu, bins=(bins_res, bins_clu))
+    sp = sp.astype(np.uint8)
+
+    mask = mat['Clu']['shank'][0][0][0] <= ca1_threshold
+    sp = sp[:, mask]
+
+    return sp
+
+def longest_stretch(bool_array):
+    """
+    Finds longest contiguous stretch of True values
+
+    Input:
+    bool_array = boolean vector
+
+    Output:
+    bool_most_common = boolean vector, True only for longest stretch of 'True' in bool_array
+    """
+    bool_array_diff = np.append(bool_array[0], bool_array)
+    bool_array_diff = np.cumsum(np.abs(np.diff(bool_array_diff)))
+    bool_most_common = bool_array_diff == mode(bool_array_diff[bool_array])[0]
+    return bool_most_common
+
+def get_behav(mat_file, fs=25):
+    """
+    Organizes information about rat behavior into a matrix
+
+    Input:
+    mat_file: file containing behavioral data
+    fs = sampling frequency
+
+    Output:
+    lapID = Data stored in the format listed below
+
+    lapID format:
+    Column 0: Trial Number
+    Column 1: Maze arm (-1/0/1/2) (-1 = not in maze arm)
+    Column 2: Correct (0/1)
+    Column 3: other/first approach/port/last departure (0/1/2/3)
+    Column 4: x position in mm
+    """
+    dec = int(1250 / fs)  # decimation factor
+    mat = io.loadmat(mat_file, variable_names=['Track'])
+
+    lapID = np.array([np.squeeze(mat['Track']["lapID"][0][0])[::dec]], dtype='float32') - 1
+    lapID = np.append(lapID, [np.squeeze(mat['Track']["mazeSect"][0][0])[::dec]], axis=0)
+    lapID = np.append(lapID, [np.squeeze(mat['Track']["corrChoice"][0][0])[::dec]], axis=0)
+    lapID = np.append(lapID, np.zeros((1, len(lapID[0]))), axis=0)
+    lapID = np.append(lapID, decimate(mat['Track']["xMM"][0][0].T, dec), axis=0)
+    lapID = lapID.T
+
+    # Filter values and construct column 3
+    in_arm = np.in1d(lapID[:, 1], np.array(range(4, 10)))  # rat is occupying a maze arm
+    in_end = np.in1d(lapID[:, 1], np.array(range(7, 10)))
+    # lapID[np.in1d(lapID[:,1], np.array(range(4, 10)), invert = True), 1] = -1
+    lapID[in_arm, 1] = (lapID[in_arm, 1] - 1) % 3
+    lapID[~in_arm, 1] = -1
+    # lapID[lapID[:, 1] == 0, :] = 0
+
+    for i in range(int(np.max(lapID[:, 0]))):
+        r = np.logical_and(lapID[:, 0] == i, in_end)  # lapID[:, 3] == 2)
+        inds = np.where(np.logical_and(lapID[:, 0] == i, in_arm))[0]
+        all_end = np.where(r)[0]
+        # if all_end.size > 0: #valid trial where rat goes to end of arm
+        lapID[inds[inds < all_end[0]], 3] = 1
+        lapID[inds[inds > all_end[-1]], 3] = 3
+        lapID[longest_stretch(r), 3] = 2
+
+    # Return structured data
+    return lapID
+
+
+for i in range(1, N_SESSIONS + 1):
+
+    # load behavioral labels from data0i.mat
+    raw   = io.loadmat(f"{DATA_PATH}/data0{i}.mat")
+    lapID = raw["lapID"]  # (n_timesteps, 6)
+
+    # load CA1-only spikes from rec file using get_spikes()
+    spikes = get_spikes(
+        f"{DATA_PATH}/rec0{i}_BehavElectrDataLFP.mat",
+        fs=FS, session=i).astype(np.float32)
+
+    n_timesteps, n_neurons = spikes.shape
+    print(f"\n Session {i} (timesteps={n_timesteps}, neurons={n_neurons})")
+
+    orig_rows = np.arange(n_timesteps)
+    assert n_timesteps == lapID.shape[0]
+
+    # lowpass filter
+    spikes_filt = filter_data(spikes, cutoff=CUTOFF, fs=FS, filt_type='low').astype(np.float32)
+
+    # ── build 6 virtual arms: phase1 arms 0-2 -> 0-2, phase3 arms 0-2 -> 3-5 ──
+    virtual_arm = -np.ones(n_timesteps, dtype=int)
+    mask_p1 = lapID[:, COL_PHASE] == 1
+    mask_p3 = lapID[:, COL_PHASE] == 3
+    virtual_arm[mask_p1] = lapID[mask_p1, COL_ARM].astype(int)
+    virtual_arm[mask_p3] = lapID[mask_p3, COL_ARM].astype(int) + 3
+
+    # ── assign each (trial, virtual arm) group to a fold, balanced + randomized ──
+    n_folds = 5
+    fold_assign = -np.ones(n_timesteps, dtype=int)
+    ctr = np.zeros(6, dtype=int)
+
+    trials = np.unique(lapID[:, COL_TRIAL]).astype(int)
+    np.random.shuffle(trials)  # randomize trial order for fold assignment
+
+    for t in trials:
+        for v_arm in range(6):
+            inds = (lapID[:, COL_TRIAL] == t) & (virtual_arm == v_arm)
+            if np.sum(inds):
+                fold_assign[inds] = ctr[v_arm] % n_folds
+                ctr[v_arm] += 1
+
+    # ── build trainInds / testInds from fold_assign (phase 1 & 3 only) ──
+    trainInds = np.zeros((n_timesteps, n_folds), dtype=bool)
+    testInds  = np.zeros((n_timesteps, n_folds), dtype=bool)
+
+    for fold in range(n_folds):
+        testInds[:, fold] = fold_assign == fold
+        train_candidates = (fold_assign != fold) & (fold_assign >= 0)
+        train_idx = balanced_indices(virtual_arm, train_candidates)
+        trainInds[train_idx, fold] = True
+
+    # build boolean mask from all conditions
+    mask2 = (
+        (lapID[:, 0] >= 0) &   # trial number >= 0
+        (lapID[:, 1] >= 0)     # maze arm >= 0
+    )
+
+    print('phase values before mask2:', np.unique(lapID[:, COL_PHASE]))
+    print('mask2 sum:', np.sum(mask2))
+
+    lapID = lapID[mask2]
+    print('phase values after mask2:', np.unique(lapID[:, COL_PHASE]))
+
+    spikes_filt = spikes_filt[mask2]
+    orig_rows   = orig_rows[mask2]
+    trainInds   = trainInds[mask2, :]
+    testInds    = testInds[mask2, :]
+    virtual_arm = virtual_arm[mask2]
+    fold_assign = fold_assign[mask2]
+
+    X_cat = spikes_filt.astype(np.float64)
+
+    # position as its own variable
+    pos_out = lapID[:, COL_XPOS].reshape(-1, 1).astype(np.float64)
+    velocity = np.append(0,np.diff(pos_out[:,0]))
+
+    # cv_fold: 1-5 for phase 1/3 samples, 0 for phase 2 / other (not applicable)
+    cv_fold_out = np.where(fold_assign >= 0, fold_assign + 1, 0).astype(np.int32)
+
+    lapID_out = np.column_stack([
+        lapID[:, COL_TRIAL].astype(np.int32),   # trial number
+        cv_fold_out,                            # cross-validation fold (1-5, 0 = N/A)
+        virtual_arm.astype(np.int32),           # 0-5 virtual arm (phase1: 0-2, phase3: 3-5; else -1)
+        (orig_rows + 1).astype(np.int32),       # 1-based orig index
+        lapID[:, COL_PHASE].astype(np.int32),   # phase
+    ])
+
+    # ... after building lapID_out ...
+    print('lapID_out column 3 unique:', np.unique(lapID_out[:, 3]))
+
+    save_dir = '/content/drive/MyDrive/beatLab/processed-rat-data/'
+    os.makedirs(save_dir, exist_ok=True)
+    fname = os.path.join(save_dir, f"spDat{i}0.mat")
+
+    save_dict = {
+        "X": X_cat,
+        "lapID": lapID_out,
+        "pos": pos_out,
+        "vel": velocity,
+        "trainInds": trainInds,
+        "testInds": testInds,
+    }
+
+    print(save_dict.keys())
+    io.savemat(fname, save_dict)
+    print(f"saved {fname}")
