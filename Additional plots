@@ -1,0 +1,53 @@
+#investigating fast drift
+idx = 500
+phase = lapID[:idx, 4]
+starts = np.r_[0, np.where(np.diff(phase) != 0)[0] + 1]
+plt.figure(figsize=(20, 5))
+for s in starts:
+    plt.axvline(x=s, color='r', linestyle='--', linewidth=0.8)
+plt.plot(err_spk_sorted2[:idx], color='green', label='LFP')
+plt.plot(err_spk_sorted[:idx], color='blue', label='spikes')
+
+
+
+#investigating drift during different phases
+import math
+phase2 = []
+phase0 = []
+phase1 = []
+phase3 = []
+duringtrialdiff = 0
+during = 1
+first = 0
+last = 0
+for k in range(1, len(lapID[:,0])):
+    diff = np.abs(np.nanmedian(err_spk_sorted[k:k+5]) - np.nanmedian(err_spk_sorted[k-6:k-1]))
+    if lapID[k, 4] == lapID[k-1, 4]:
+        during += 1
+    if lapID[k, 4] > lapID[k-1, 4]:
+        phase2.append(float(diff))
+        last = np.nanmedian(err_spk_sorted[k-6:k-1])
+        first = np.nanmedian(err_spk_sorted[k-during:k-during+5])
+        duringtrialdiff = np.abs(last - first)
+        phase1.append(float(duringtrialdiff))
+        during = 1
+    if lapID[k, 4] < lapID[k-1, 4]:
+        phase0.append(float(diff))
+        last = np.nanmedian(err_spk_sorted[k-6:k-1])
+        first = np.nanmedian(err_spk_sorted[k-during:k-during+5])
+        duringtrialdiff = np.abs(last - first)
+        phase3.append(float(duringtrialdiff))
+        during = 1
+phase0 = np.array(phase0)
+phase0 = phase0[~np.isnan(phase0)]
+phase1 = np.array(phase1)
+phase1 = phase1[~np.isnan(phase1)]
+phase2 = np.array(phase2)
+phase2 = phase2[~np.isnan(phase2)]
+phase3 = np.array(phase3)
+phase3 = phase3[~np.isnan(phase3)]
+plt.boxplot([phase1,phase2,phase3,phase0], labels=['Phase 1 drift', 'Phase 2 drift', 'Phase 3 drift', 'Phase 0 drift'])
+plt.show()
+
+
+
