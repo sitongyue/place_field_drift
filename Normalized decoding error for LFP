@@ -13,7 +13,7 @@ from scipy.ndimage import gaussian_filter
 
 # ── paths ─────────────────────────────────────────────────────────────────────
 fldr      = '/content/drive/MyDrive/beatLab/processed-rat-data/'
-spk_fldr  = '/content/drive/MyDrive/beatLab/raffi_trained_models_spikes/'
+LFP_fldr  = '/content/drive/MyDrive/beatLab/raffi_trained_LFP_models_spikes/'
 
 n_sess   = 4
 ks = [64]
@@ -36,8 +36,8 @@ def compute_errors(Yhat, km, pos):
       if xyg[i,1] >=3:
         new_xyg = np.append(new_xyg, -xyg[i,0]+xyg[i,1]+1)
     err = new_xyg - new_pos
-    err[(xyg[:, 0] - pos[:, 0])>.3] = np.nan #if error is bigger than .3 or smaller than -.3 it becomes nan because that is a mistake from the decoder and not significant to showing drift
-    err[(xyg[:, 0] - pos[:, 0])<-.3] = np.nan
+    err[(new_xyg - new_pos)>.3] = np.nan #if error is bigger than .3 or smaller than -.3 it becomes nan because that is a mistake from the decoder and not significant to showing drift
+    err[(new_xyg - new_pos)<-.3] = np.nan
     err[xyg[:, 1] != pos[:, 1]] = np.nan  # wrong arm gives error of 1
     return err
 
@@ -51,98 +51,101 @@ def load_keras_weights(model, filepath):
 # ── main computation ──────────────────────────────────────────────────────────
 # err_allsess[i] = dict with keys 'spk', 'time_inds'
 #   each value is a list of per-sample arrays (one per fold)
-err_allsess = []
+err_allsess2 = []
 
 for i in range(n_sess):
     sess = i + 1
     print(f'\n=== Session {sess} ===')
 
-    mat = sio.loadmat(fldr + f'spDat{sess}0.mat')
-    lapID = mat['lapID']
+    mat = sio.loadmat(fldr + f'pyDat{sess}0.mat')
     pos = mat['pos']
-    vel = mat['vel']
+    lapID = mat['lapID']
+    pos = filter_data(pos, cutoff=4, fs=25, filt_type='low').astype(np.float32)
+    vel = mat['vel'].ravel()
     pos = pos-np.min(pos,axis=0)
     pos = pos/np.expand_dims(np.max(pos,axis=0),axis=0)
     pos = np.hstack((pos,mat['lapID'][:,2].reshape((-1,1))))
-
-    mask = ((lapID[:,4] == 1) | (lapID[:,4] == 3)) & (np.abs(vel) > 8) 
+    mask = (((lapID[:,4] == 1) & (vel > 6)) | ((lapID[:,4] == 3) & (vel < -6)))
     mask = mask.ravel()
-    mask2 = (lapID[:,4] == 2) & (np.abs(vel) > 8)
-    mask2 = mask2.ravel()
-
-    pos2 = pos[mask2]
     pos = pos[mask]
+    pos[:,0] = pos[:,0]/np.max(pos[:,0])
 
-    pos[:,0] = pos[:,0]/np.min(pos2[:,0]) #dividing by the minimum in phase 2 so that the values can be normalized between 0 and 1
-    
     lapID = lapID[mask]
-    X = mat['X'][mask]
 
     # RBF targets
     Y, km = makeRBF_linear2(pos, int(ks[0]), sigs[0])
     num_chans = Y.shape[1]
 
-    err_spk_folds  = np.zeros(Y.shape[0])
+    err_LFP_folds  = np.zeros(Y.shape[0])
+
+    X_orig = mat['X'][mask].copy()  # save original before fold loop
 
     for kk in range(folds):
-        fold = kk+1
+        fold = kk + 1
         print(f'\n Fold {fold}')
-        inds_test  = lapID[:, 1] == fold      # this fold is the test set
-        #inds_train = lapID[:, 1] != fold      # everything else is training
+        inds_test  = lapID[:, 1] == fold
+        inds_train = lapID[:, 1] != fold
 
-        # ── SPIKE decoder ─────────────────────────────────────────────────────
-        X_spk = X[inds_test]
+        wLFPs, _, _ = whiten(X_orig, inds_train)
+        X_w = wLFPs * np.exp(-1j * np.angle(wLFPs[:,0])).reshape((-1,1))
+        X_w = np.concatenate((np.real(X_w), np.imag(X_w)), axis=1)
 
-        # ── trial indices for chronological sorting ───────────────────────────
         # use lap number (lapID[:,0]) as the time index for each test sample
         backend.clear_session()
-        spk_model = models.Sequential([
-            layers.Dense(num_chans, input_shape=(X_spk.shape[1],),
+        LFP_model = models.Sequential([
+            layers.Dense(num_chans, input_shape=(X_w.shape[1],),
                          kernel_constraint=constraints.unit_norm()),
             layers.Activation(activations.softmax)
         ])
-        spk_model.load_weights(
-            spk_fldr + f'model_sess{sess}_fold{fold}_k0_sig0.weights.h5'
+        LFP_model.load_weights(
+            f'{LFP_fldr} model_sess{i}_fold{kk}_k0_sig0.weights.h5'
         )
 
-        Yhat_spk = np.argmax(spk_model.predict(X_spk, verbose=0), axis=1)
-        err_spk  = compute_errors(Yhat_spk, km, pos[inds_test])
-        err_spk_folds[inds_test] = err_spk
+        Yhat_LFP = np.argmax(LFP_model.predict(X_w[inds_test], verbose=0), axis=1)
+        err_LFP  = compute_errors(Yhat_LFP, km, pos[inds_test])
+        err_LFP_folds[inds_test] = err_LFP
 
 #list of four vectors
-    err_allsess.append({
-        'spk':       err_spk_folds
+    err_allsess2.append({
+        'LFP':       err_LFP_folds,
+        'lapID':     lapID
     })
-
 
 
 # ── plotting ──────────────────────────────────────────────────────────────────
 fig, axes = plt.subplots(2, 2, figsize=(14, 8))
 myFontSize = 14
 
-err_spk_all = []
+err_spk_all2 = []
 for i, ax in enumerate(axes.flat):
     sess = i + 1
 
-    err_spk_all   = (err_allsess[i]['spk'])
-    print(len(err_spk_all))
+    err_spk_all2   = (err_allsess2[i]['LFP'])
     #time_inds_all = np.concatenate(err_allsess[i]['time_inds'])
     #sort_order    = np.argsort(time_inds_all, kind='stable')
-    err_spk_sorted = err_spk_all
-    t = np.arange(len(err_spk_sorted))
+    err_spk_sorted2 = err_spk_all2
+    t = np.arange(len(err_spk_sorted2))
+    lapID = err_allsess2[i]['lapID']
 
-    ax.plot(t, err_spk_sorted, color='#0072BD', linewidth=0.5, label=f'Spike Error ({ks[0]} RBFs)')
+    betweentrials = []
+    for i in range(1, len(lapID[:,0])):
+      if lapID[i,0] > lapID[i-1,0]:
+        betweentrials.append(t[i])
+
+    ax.plot(t, err_spk_sorted2, color='firebrick', linewidth=0.5, label=f'LFP Error ({ks[0]} RBFs)')
     ax.axhline(0, color='black', linewidth=0.8, linestyle='--')
+    #for bt in betweentrials:
+    #  ax.axvline(bt, color='purple')
 
     # rolling mean
-    masked_errors = err_spk_sorted.copy()
-    masked_errors[err_spk_sorted == 0] = np.nan  # mask zeroed-out errors
-    window = 700
+    masked_errors = err_spk_sorted2.copy()
+    masked_errors[err_spk_sorted2 == 0] = np.nan  # mask zeroed-out errors
+    window = 500
     mean_err = np.array([
        np.nanmean(masked_errors[max(0, j-window//2):min(len(masked_errors), j+window//2)])
         for j in range(len(masked_errors))
     ])
-    ax.plot(t, mean_err, color='red', linewidth=2, label=f'Mean error (window={window})')
+    ax.plot(t, mean_err, color='blue', linewidth=2, label=f'Mean error (window={window})')
 
     ax.set_ylim(-0.4, 0.4)
     ax.set_xlim(0, len(t)) #total = len(t) # change based on zooming into data
