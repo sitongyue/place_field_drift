@@ -1,0 +1,184 @@
+from keras.callbacks import EarlyStopping
+from keras import models, layers, optimizers, backend,constraints,activations
+import complexnn
+from scipy import io
+import numpy as np
+from random import sample
+from scipy import signal
+
+def balanced_indices(vector, bool_indices):
+    """
+    Returns indices that balance the number of samples for each label in vector
+
+    Parameters:
+    vector: The input vector from which to select indices.
+    bool_indices: A boolean array indicating which indices in the vector to consider.
+
+    Returns:
+    list: A list of indices representing a balanced selection of the unique values in the subset of the vector.
+
+    Generated using ChatGPT
+    """
+    # Convert boolean indices to actual indices
+    actual_indices = np.where(bool_indices)[0]
+
+    # Extract the elements and their corresponding indices
+    selected_elements = [(vector[i], i) for i in actual_indices]
+
+    # Find unique elements
+    unique_elements = np.unique(vector[bool_indices])
+
+    # Group elements by value and collect their indices
+    elements_indices = {element: [] for element in unique_elements}
+    for value, idx in selected_elements:
+        if value in elements_indices:
+            elements_indices[value].append(idx)
+
+    # Find the minimum count among the unique elements
+    min_count = min(len(elements_indices[element]) for element in unique_elements)
+
+    # Create a balanced set of indices
+    balanced_indices_set = []
+    for element in unique_elements:
+        if len(elements_indices[element]) >= min_count:
+            balanced_indices_set.extend(sample(elements_indices[element], min_count))
+
+    return np.array(balanced_indices_set)
+
+def makeRBF_linear2(pos, n_bases, sigma):
+    pvecx = np.linspace(0, 1, n_bases)
+    pvecy = np.linspace(0, 5, 6)  # 6 virtual arms instead of 3
+
+    xg, yg = np.meshgrid(pvecx, pvecy)
+    xg = xg.reshape((1, -1))
+    yg = yg.reshape((1, -1))
+
+    sigma = sigma**2
+    xDiff = (pos[:, 0].reshape((-1, 1)) - xg)**2
+    xDiff = np.exp(-xDiff/sigma/2) * (pos[:, 1].reshape((-1, 1)) == yg)
+    row_sums = np.sum(xDiff, axis=1).reshape((-1, 1))
+    xDiff = xDiff / (row_sums + 1e-10)
+    xg = np.vstack((xg, yg)).T
+    return xDiff, xg
+
+def filter_data(data, cutoff, fs, filt_type='high', order=5, use_hilbert=False):
+    """
+    Applies a column-wise zero-phase filter to data
+
+    Parameters:
+    data : a T x N array with filtered data
+    cutoff : cutoff frequency (should be 2 numbers for 'band')
+    fs : sampling rate
+    filt_type : specify as 'high', 'low', or 'band'.
+    order : filter order. The default is 5.
+    use_hilbert: whether to apply a Hilbert transform (default = False)
+
+    Returns
+    -------
+    data : a T x N array with filtered data
+    """
+    nyq = 0.5 * fs
+    if filt_type == 'band':
+        if len(cutoff) != 2:
+            raise ValueError("Cutoff should contain exactly two numbers for 'band' filter type.")
+        normal_cutoff = [c / nyq for c in cutoff]
+    else:
+        normal_cutoff = cutoff / nyq
+
+    b, a = signal.butter(order, normal_cutoff, btype=filt_type, analog=False)
+    data = signal.filtfilt(b, a, data, axis=0)
+    if use_hilbert:
+        data = signal.hilbert(data, axis=0)
+    return data
+
+def whiten(X, inds_train, fudge_factor=10 ** -5):
+    """
+    Decorrelates the input data
+
+    Parameters:
+    - X: A TxN array of data, can be complex-valued
+    - inds_train: which samples to use to estimate correlations
+    - fudge_factor: adds a small constant to lessen the influence of small, noisy directions in the data
+
+    Returns:
+    - X: decorrelated data
+    - u: directions of highest variance in original data
+    - Xv: scaling factor used to normalize decorrelated data
+    """
+    _, _, u = np.linalg.svd(X[inds_train, :], full_matrices=False, compute_uv=True)
+    X = X @ np.conj(u.T)
+    Xv = np.var(X[inds_train, :], axis=0)
+    Xv = np.sqrt(Xv + sum(Xv) * fudge_factor)
+    X = X / Xv
+    return X, u, Xv
+
+
+
+#spike decoder
+ks = [64] #how many RBFs to put down per track
+sigs = [.11] #sigma for each RBF
+folds = 5
+allDat = np.empty((4,folds,len(ks),len(sigs),6))
+es = EarlyStopping(monitor='val_loss', patience = 14)
+fldr = '/content/drive/MyDrive/beatLab/processed-rat-data/' #where data lives
+savefldr = '/content/drive/MyDrive/beatLab/raffi_trained_LFP_models_spikes/'
+
+for i in range(allDat.shape[0]):#skip first session
+    mat = io.loadmat(fldr + 'pyDat' + str(i+1) + '0.mat')
+    pos = mat['pos']
+    lapID = mat['lapID']
+    pos = filter_data(pos, cutoff=4, fs=25, filt_type='low').astype(np.float32)
+    vel = mat['vel'].ravel()
+    pos = pos-np.min(pos,axis=0)
+    pos = pos/np.expand_dims(np.max(pos,axis=0),axis=0)
+    pos = np.hstack((pos,mat['lapID'][:,2].reshape((-1,1))))
+    mask = (((lapID[:,4] == 1) & (vel > 6)) | ((lapID[:,4] == 3) & (vel < -6)))
+    mask = mask.ravel()
+    pos = pos[mask]
+    pos[:,0] = pos[:,0]/np.max(pos[:,0])
+
+    lapID = lapID[mask]
+
+    X_orig = mat['X'][mask].copy()
+
+    for kk in range(allDat.shape[1]):
+        fold = kk + 1
+        inds_test  = lapID[:, 1] == fold      # this fold is the test set
+        inds_train = lapID[:, 1] != fold      # everything else is training
+
+        wLFPs, _, _ = whiten(X_orig, inds_train)
+        X = wLFPs*np.exp(-1j*np.angle(wLFPs[:,0])).reshape((-1,1)) #this looks like demodulating
+        X = np.concatenate((np.real(X),np.imag(X)),axis=1) #this looks like concatenating real and imaginary
+
+
+        for k in range(allDat.shape[2]):
+            for l in range(allDat.shape[3]):
+                Y,km = makeRBF_linear2(pos, int(ks[k]),sigs[l])
+                num_chans = Y.shape[1]
+                backend.clear_session()
+                adam = optimizers.Adam(learning_rate = .001)
+                model = models.Sequential()
+                # for demodulation use next line
+                model.add(layers.Dense(num_chans,input_shape=(X.shape[1],),kernel_constraint=constraints.unit_norm()))
+                # for abs-decoding use next 2 lines
+                #model.add(complexnn.dense.ComplexDense(num_chans,input_shape=(X.shape[1],),use_bias=False,kernel_constraint=constraints.unit_norm()))
+                #model.add(layers.Lambda(lambda x: (x[:,:x.shape[1]//2]**2 + x[:,x.shape[1]//2:]**2)**.5))
+                model.add(layers.Activation(activations.softmax))
+                print(f'Session {i+1}, fold {kk+1}: k={k}, sig={l}')
+                model.compile(loss='mse', optimizer=adam,metrics = ['accuracy'])
+                fittedModel = model.fit(X[inds_train,:], Y[inds_train,:], epochs = 100,
+                    verbose = 2, validation_data=(X[inds_test,:],Y[inds_test,:]),
+                    shuffle=True, callbacks=[es])
+                Yhat = np.argmax(model.predict(X),axis = 1)
+                xyg = km[Yhat,:]
+                err = np.abs(xyg[:,0]-pos[:,0]) #absolute error
+                err[xyg[:,1] != pos[:,1]] = 1 #if wrong track, err = 1
+                allDat[i][kk][k][l][0] = fittedModel.history['accuracy'][-2]
+                allDat[i][kk][k][l][1] = fittedModel.history['val_accuracy'][-2]
+                allDat[i][kk][k][l][2] = fittedModel.history['loss'][-2]
+                allDat[i][kk][k][l][3] = fittedModel.history['val_loss'][-2]
+                allDat[i][kk][k][l][4] = np.mean(err[inds_train])
+                allDat[i][kk][k][l][5] = np.mean(err[inds_test]) #mean test error
+                print(f'mean test error = {np.mean(err[inds_test])}')
+                model.save_weights(f'{savefldr} model_sess{i}_fold{kk}_k0_sig0.weights.h5')
+                del model, fittedModel
