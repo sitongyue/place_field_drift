@@ -72,14 +72,50 @@ def makeRBF_linear2(pos, n_bases, sigma):
     xg = np.vstack((xg, yg)).T
     return xDiff, xg
 
+def filter_data(data, cutoff, fs, filt_type='high', order=5, use_hilbert=False):
+    """
+    Applies a column-wise zero-phase filter to data
+
+    Parameters:
+    data : a T x N array with filtered data
+    cutoff : cutoff frequency (should be 2 numbers for 'band')
+    fs : sampling rate
+    filt_type : specify as 'high', 'low', or 'band'.
+    order : filter order. The default is 5.
+    use_hilbert: whether to apply a Hilbert transform (default = False)
+
+    Returns
+    -------
+    data : a T x N array with filtered data
+    """
+    nyq = 0.5 * fs
+    if filt_type == 'band':
+        if len(cutoff) != 2:
+            raise ValueError("Cutoff should contain exactly two numbers for 'band' filter type.")
+        normal_cutoff = [c / nyq for c in cutoff]
+    else:
+        normal_cutoff = cutoff / nyq
+
+    b, a = signal.butter(order, normal_cutoff, btype=filt_type, analog=False)
+    data = signal.filtfilt(b, a, data, axis=0)
+    if use_hilbert:
+        data = signal.hilbert(data, axis=0)
+    return data
+
 
 
 # spikes decoder with optimal hyperparameters
 
 folds = 5 #number of folds for training in 5-fold cross validation
 #RBF = Radial basis function - this is the gaussian distribution you use for each position on the track
-ks = [64]
+# ks = np.linspace(3,10,8)**2 - optimal parameter search for how many RBFs to put down per track
+#np.linspace(3,10,8) looks at values 3 to 10 and then **2 squares them because "equal multiplicative steps are more meaningful than equal additive steps."
+ks = [64] #should be 64 for error
 
+# sigs = np.linspace(.025,.1,4) #sigma for each RBF
+# sigs = np.linspace(.1,.2,5) # grid 2
+# sigs = np.linspace(.05,0.15,5) # grid 3
+#also an optimal parameter search where he first realized it needed to be higher than .1 then lower than .2 and then zoomed in between .05 and .15
 sigs = [0.11]
 
 # dim 1: session # (NOTE: only sessions 1 through 4 are relevant)
@@ -89,7 +125,7 @@ sigs = [0.11]
 # dim 5: metrics
 allDat = np.zeros((4,folds,len(ks),len(sigs),6)) # def dimensions for allDat
 
-es = EarlyStopping(monitor='val_loss', patience=14) 
+es = EarlyStopping(monitor='val_loss', patience=14) #Chae had early stopping of 3 but I found 15 gives better error results
 fldr = '/content/drive/MyDrive/beatLab/processed-rat-data/' #where data lives
 savefldr = '/content/drive/MyDrive/beatLab/raffi_trained_models_spikes/'
 # ^ change this before running
@@ -98,28 +134,20 @@ err_allsess = []
 for i in range(allDat.shape[0]): # loops through sessions 1 thru 4
     #io.loadmat converts matlab file into python file
     #fldr + 'spDat' + str(i+1) + '0.mat' outputs /content/drive/MyDrive/beatLab/processed-rat-data/spDat(i+1)0.mat
-    mat = io.loadmat(fldr + 'spDat' + str(i+1) + '0.mat') #only spike data for all phases
-    lapID = mat['lapID']
+    mat = io.loadmat(fldr + 'spDat' + str(i+1) + '0.mat')
     pos = mat['pos']
-    vel = mat['vel']
+    lapID = mat['lapID']
+    pos = filter_data(pos, cutoff=4, fs=25, filt_type='low').astype(np.float32)
+    vel = mat['vel'].ravel()
     pos = pos-np.min(pos,axis=0)
     pos = pos/np.expand_dims(np.max(pos,axis=0),axis=0)
     pos = np.hstack((pos,mat['lapID'][:,2].reshape((-1,1))))
-
-    #mask keeps only phases 1 and 3 and when rat is moving (vel>8)
-    mask = ((lapID[:,4] == 1) | (lapID[:,4] == 3)) & (np.abs(vel) > 8) 
+    mask = (((lapID[:,4] == 1) & (vel > 6)) | ((lapID[:,4] == 3) & (vel < -6)))
     mask = mask.ravel()
-    #mask2 allows us to divide by phase 2 so that we can normalize position values correctly
-    mask2 = (lapID[:,4] == 2) & (np.abs(vel) > 8)
-    mask2 = mask2.ravel()
-
-    pos2 = pos[mask2]
     pos = pos[mask]
+    pos[:,0] = pos[:,0]/np.max(pos[:,0])
 
-    pos[:,0] = pos[:,0]/np.min(pos2[:,0]) #dividing by the minimum in phase 2 so that the values can be normalized between 0 and 1
-    
     lapID = lapID[mask]
-
 
     for kk in range(allDat.shape[1]):   # cross-validation=5 #choose 4 folds for training and 1 for testing
         fold = kk + 1
@@ -128,13 +156,13 @@ for i in range(allDat.shape[0]): # loops through sessions 1 thru 4
 
         X = mat['X'][mask]
 
-        for k in range(allDat.shape[2]): #RBFs
-            for l in range(allDat.shape[3]): #sigma for RBFs
+        for k in range(allDat.shape[2]): #RBFs - since allDat.shape[2] is a list with one element it will only iterate once
+            for l in range(allDat.shape[3]): #sigma for RBFs - since allDat.shape[3] is a list with one element it will only iterate once
                 Y,km = makeRBF_linear2(pos, int(ks[k]),sigs[l]) # make RBFs
                 #km tells which arm and which position in each arm each RBF is
                 #Y is a matrix with probabilities of which RBF the rat is in given rats position and arm
                 num_chans = Y.shape[1]
-                #num_chans=384=total RBFs (384/6=64)
+                #num_chans=192=total RBFs (192/3=64)
                 backend.clear_session()
                 #forgets previous keras session to prevent conflicts between old and new models
                 adam = optimizers.Adam(learning_rate=.001)
